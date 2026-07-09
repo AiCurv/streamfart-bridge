@@ -36,7 +36,7 @@ jobs:
 
       - name: Show job info
         env:
-          PAYLOAD_URLS: ${{ github.event.client_payload.urls }}
+          PAYLOAD_URLS: ${{ toJSON(github.event.client_payload.urls) }}
           PAYLOAD_CHAT_ID: ${{ github.event.client_payload.chat_id }}
         run: |
           echo "URLs: $PAYLOAD_URLS"
@@ -46,7 +46,7 @@ jobs:
         id: download
         env:
           PAYLOAD_MODE: ${{ github.event.client_payload.mode }}
-          PAYLOAD_URLS: ${{ github.event.client_payload.urls }}
+          PAYLOAD_URLS: ${{ toJSON(github.event.client_payload.urls) }}
         run: |
           set -eu
           echo "$PAYLOAD_URLS" > /tmp/urls.json
