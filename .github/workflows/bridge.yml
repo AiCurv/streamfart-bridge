@@ -29,8 +29,19 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y jq
-          go install github.com/storageto/cli/cmd/storageto@latest
-          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+          # Install Go (Ubuntu LTS often ships 1.18; storageto needs 1.22+)
+          if ! command -v go >/dev/null 2>&1 || [ "$(go version | awk '{print $3}' | sed 's/go//' | cut -d. -f1,2)" \< "1.22" ]; then
+            sudo apt-get install -y golang-1.22 || true
+            if command -v go-1.22 >/dev/null 2>&1; then
+              sudo ln -sf $(which go-1.22) /usr/local/bin/go
+            fi
+            go version || true
+          fi
+          # Build the CLI from the official repo (go install URL doesn't match module path)
+          git clone --depth 1 https://github.com/storageto/cli.git /tmp/storageto-cli
+          cd /tmp/storageto-cli
+          go build -o "$RUNNER_TEMP/storageto" ./cmd/storageto
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
           storageto --version
 
       - name: Show job info
