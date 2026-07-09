@@ -12,7 +12,6 @@
     "@types/node": "^20.14.0"
   },
   "scripts": {
-    "build": "tsc api/webhook.ts --outDir dist --module nodenext --target es2022",
     "test": "bash scripts/test_dispatch.sh"
   }
 }
