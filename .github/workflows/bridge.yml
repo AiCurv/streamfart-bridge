@@ -35,16 +35,18 @@ jobs:
           storageto version
 
       - name: Show job info
+        env:
+          PAYLOAD_URLS: ${{ github.event.client_payload.urls }}
+          PAYLOAD_CHAT_ID: ${{ github.event.client_payload.chat_id }}
         run: |
-          echo "Event payload: ${{ toJSON(github.event.client_payload) }}"
-          echo "Mode: ${{ github.event.client_payload.mode }}"
+          echo "URLs: $PAYLOAD_URLS"
+          echo "Chat: $PAYLOAD_CHAT_ID"
 
-      - name: Process links
-        id: process
+      - name: Download files
+        id: download
         env:
           PAYLOAD_MODE: ${{ github.event.client_payload.mode }}
           PAYLOAD_URLS: ${{ github.event.client_payload.urls }}
-          PAYLOAD_CHAT_ID: ${{ github.event.client_payload.chat_id }}
         run: |
           set -eu
           echo "$PAYLOAD_URLS" > /tmp/urls.json
@@ -55,7 +57,7 @@ jobs:
           cd /tmp/dl
 
           i=0
-          while [ $i -lt "$N" ]; do
+          while [ "$i" -lt "$N" ]; do
             URL=$(jq -r ".[$i]" /tmp/urls.json)
             echo "==> [$((i+1))/$N] $URL"
             OUTNAME="file_$i.bin"
@@ -101,49 +103,40 @@ jobs:
             echo "::error::No files downloaded"
             exit 1
           fi
-          if [ "$N" = "1" ]; then
-            storageto upload --json $FILES > /tmp/result.json
-          else
-            storageto upload --json $FILES > /tmp/result.json
-          fi
+          storageto upload --json $FILES > /tmp/result.json
           echo "--- storageto result ---"
           cat /tmp/result.json
+          jq . /tmp/result.json
 
       - name: Send result to Telegram
         env:
+          RESULT: /tmp/result.json
           PAYLOAD_CHAT_ID: ${{ github.event.client_payload.chat_id }}
         run: |
           set -eu
           CHAT_ID="$PAYLOAD_CHAT_ID"
           BOT_TOKEN="$TELEGRAM_BOT_TOKEN"
-          RESULT=/tmp/result.json
 
           IS_COLL=$(jq -r '.is_collection' "$RESULT")
           if [ "$IS_COLL" = "true" ]; then
             RAW_URL=$(jq -r '.collection_info.raw_url' "$RESULT")
             PUBLIC_URL=$(jq -r '.collection_info.url' "$RESULT")
             EXPIRES=$(jq -r '.collection_info.expires_at' "$RESULT")
+            M3U_PATH=/tmp/playlist.m3u
+            printf '#EXTM3U\n' > "$M3U_PATH"
+            jq -r '.collection_info.files[] | "#EXTINF:-1," + .name + "\n" + .raw_url' "$RESULT" >> "$M3U_PATH"
+            cat "$M3U_PATH"
+            MSG="Collection uploaded!\n\nLink: ${PUBLIC_URL}\nM3U: ${RAW_URL}\nExpires: ${EXPIRES}\n\nOpen the M3U in VLC / MX Player for sequential playback."
           else
             RAW_URL=$(jq -r '.file_info.raw_url' "$RESULT")
             PUBLIC_URL=$(jq -r '.file_info.url' "$RESULT")
             EXPIRES=$(jq -r '.file_info.expires_at' "$RESULT")
+            MSG="Done!\n\nPage: ${PUBLIC_URL}\nDirect: ${RAW_URL}\nExpires: ${EXPIRES}"
           fi
-
-          echo "Raw URL: $RAW_URL"
-          echo "Expires: $EXPIRES"
-
-          if [ "$IS_COLL" = "true" ]; then
-            MSG="Collection uploaded!"
-          else
-            MSG="Done!"
-          fi
-
-          # Build single-line text and send
-          TEXT="${MSG}"$'\n'"Page: ${PUBLIC_URL}"$'\n'"Direct: ${RAW_URL}"$'\n'"Expires: ${EXPIRES}"
 
           curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${CHAT_ID}" \
-            --data-urlencode "text=${TEXT}" \
+            --data-urlencode "text=${MSG}" \
             -d parse_mode=HTML > /tmp/sent.json
           cat /tmp/sent.json
 
@@ -153,8 +146,8 @@ jobs:
           PAYLOAD_CHAT_ID: ${{ github.event.client_payload.chat_id }}
         run: |
           BOT_TOKEN="$TELEGRAM_BOT_TOKEN"
-          TEXT="Bridge job failed. Check: https://github.com/${GH_REPO_OWNER_AND_NAME}/actions/runs/${{ github.run_id }}"
+          MSG="Bridge job failed. Run: https://github.com/${GH_REPO_OWNER_AND_NAME}/actions/runs/${{ github.run_id }}"
           curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${PAYLOAD_CHAT_ID}" \
-            --data-urlencode "text=${TEXT}" \
+            --data-urlencode "text=${MSG}" \
             -d parse_mode=HTML || true
