@@ -1,0 +1,191 @@
+name: Bridge bot scraper
+
+on:
+  repository_dispatch:
+    types: [bridgectl_v2]
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Test URL'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  bridge:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      GH_PAT_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+      GH_REPO_OWNER_AND_NAME: ${{ secrets.GH_REPO_OWNER_AND_NAME }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Go + storageto CLI
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y jq
+          go install github.com/storageto/cli/cmd/storageto@latest
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
+          storageto --version
+
+      - name: Show job info
+        run: |
+          echo "Event payload: ${{ toJSON(github.event.client_payload) }}"
+          echo "Mode: ${{ github.event.client_payload.mode }}"
+
+      - name: Process links
+        id: process
+        env:
+          PAYLOAD_MODE: ${{ github.event.client_payload.mode }}
+          PAYLOAD_URLS: ${{ github.event.client_payload.urls }}
+          PAYLOAD_CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          set -eu
+          # PAYLOAD_URLS is JSON string; use jq to iterate
+          echo "$PAYLOAD_URLS" > /tmp/urls.json
+          cat /tmp/urls.json
+          N=$(jq 'length' /tmp/urls.json)
+          echo "Total URLs: $N"
+          mkdir -p /tmp/dl
+          cd /tmp/dl
+
+          i=0
+          while [ $i -lt "$N" ]; do
+            URL=$(jq -r ".[$i]" /tmp/urls.json)
+            echo "==> [$((i+1))/$N] $URL"
+            OUTNAME="file_$i.bin"
+
+            if echo "$URL" | grep -qE '^https?://storage\.to/'; then
+              # Storage.to: try /r/ID first, fall back to scraping page
+              ID=$(echo "$URL" | sed -E 's#^https?://storage\.to/(r/)?##; s#\?.*##; s#/.*##')
+              echo "storage.to id=$ID"
+              curl -fsSL -o "$OUTNAME" "https://storage.to/r/$ID" || {
+                echo "direct /r/ failed, scraping page"
+                curl -fsSL "$URL" \
+                  | grep -oE 'https://cdn\.storage\.to/[^"]*\?[^"]+' \
+                  | head -1 \
+                  | xargs -I{} curl -fsSL -o "$OUTNAME" "{}"
+              }
+            elif echo "$URL" | grep -qE '^https?://pixeldrain\.dev/'; then
+              # pixeldrain: /api/file/<id>
+              if echo "$URL" | grep -qE '/api/file/'; then
+                curl -fsSL -o "$OUTNAME" "$URL"
+              else
+                ID=$(echo "$URL" | sed -E 's#^https?://pixeldrain\.dev/##; s#\?.*##; s#/.*##')
+                echo "pixeldrain id=$ID"
+                curl -fsSL -o "$OUTNAME" "https://pixeldrain.dev/api/file/${ID}?download"
+              fi
+            else
+              # Generic: just curl
+              curl -fsSL -o "$OUTNAME" "$URL"
+            fi
+
+            ls -lh "$OUTNAME" 2>/dev/null || echo "WARN: $OUTNAME missing"
+            i=$((i+1))
+          done
+
+          echo "--- Final files ---"
+          ls -lh /tmp/dl/
+
+      - name: Upload to storage.to
+        id: upload
+        working-directory: /tmp/dl
+        run: |
+          set -eu
+          # Drop empty/zero-byte files
+          find . -maxdepth 1 -type f -size 0 -delete || true
+          FILES=$(ls -1)
+          echo "Files to upload: $FILES"
+          if [ -z "$FILES" ]; then
+            echo "::error::No files downloaded"
+            exit 1
+          fi
+          if [ "$N" = "1" ]; then
+            storageto upload --json $FILES > /tmp/result.json || {
+              echo "::error::storageto upload failed"
+              cat /tmp/result.json 2>/dev/null || true
+              exit 1
+            }
+          else
+            storageto upload --json $FILES > /tmp/result.json
+          fi
+          echo "--- storageto result ---"
+          cat /tmp/result.json
+          jq . /tmp/result.json
+
+      - name: Send result to Telegram
+        env:
+          RESULT: /tmp/result.json
+          PAYLOAD_CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          set -eu
+          CHAT_ID="$PAYLOAD_CHAT_ID"
+          BOT_TOKEN="$TELEGRAM_BOT_TOKEN"
+
+          # Parse storageto JSON. It's either:
+          #   { "is_collection": false, "file_info": { raw_url, url, ... } }
+          #   { "is_collection": true,  "collection_info": { raw_url, url, files: [...] } }
+          IS_COLL=$(jq -r '.is_collection' "$RESULT")
+          if [ "$IS_COLL" = "true" ]; then
+            RAW_URL=$(jq -r '.collection_info.raw_url' "$RESULT")
+            PUBLIC_URL=$(jq -r '.collection_info.url' "$RESULT")
+            FILES_JSON=$(jq -c '.collection_info.files[]' "$RESULT")
+            EXPIRES=$(jq -r '.collection_info.expires_at' "$RESULT")
+          else
+            RAW_URL=$(jq -r '.file_info.raw_url' "$RESULT")
+            PUBLIC_URL=$(jq -r '.file_info.url' "$RESULT")
+            FILES_JSON=$(jq -c '.file_info' "$RESULT" | jq -s '.')
+            EXPIRES=$(jq -r '.file_info.expires_at' "$RESULT")
+          fi
+
+          echo "Raw URL: $RAW_URL"
+          echo "Expires: $EXPIRES"
+
+          # Build the reply
+          if [ "$IS_COLL" = "true" ]; then
+            # Build M3U from collection
+            M3U_PATH=/tmp/playlist.m3u
+            echo "#EXTM3U" > "$M3U_PATH"
+            echo "$FILES_JSON" | jq -r '.name + "|" + .raw_url' | while IFS='|' read -r NAME RURL; do
+              echo "#EXTINF:-1, $NAME"
+              echo "$RURL"
+            done >> "$M3U_PATH"
+            cat "$M3U_PATH"
+
+            # Send the collection page as one message
+            curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              -d chat_id="$CHAT_ID" \
+              --data-urlencode "text=✅ Collection uploaded!
+🔗 ${PUBLIC_URL}
+📺 M3U: ${RAW_URL}
+⏳ Expires: ${EXPIRES}
+
+Open the M3U in VLC / MX Player for sequential playback." \
+              -d parse_mode=HTML > /tmp/sent.json
+            cat /tmp/sent.json
+          else
+            curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              -d chat_id="$CHAT_ID" \
+              --data-urlencode "text=✅ Done!
+🔗 Page: ${PUBLIC_URL}
+⚡ Direct: ${RAW_URL}
+⏳ Expires: ${EXPIRES}" \
+              -d parse_mode=HTML > /tmp/sent.json
+            cat /tmp/sent.json
+          fi
+
+      - name: Notify on error
+        if: failure()
+        env:
+          PAYLOAD_CHAT_ID: ${{ github.event.client_payload.chat_id }}
+        run: |
+          BOT_TOKEN="$TELEGRAM_BOT_TOKEN"
+          curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            -d chat_id="$PAYLOAD_CHAT_ID" \
+            --data-urlencode "text=❌ Bridge job failed. Check the run: https://github.com/${GH_REPO_OWNER_AND_NAME}/actions/runs/${{ github.run_id }}" \
+            -d parse_mode=HTML || true
