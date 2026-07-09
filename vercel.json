@@ -2,8 +2,7 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
     "api/webhook.ts": {
-      "maxDuration": 10,
-      "runtime": "nodejs22.x"
+      "maxDuration": 10
     }
   },
   "rewrites": [
