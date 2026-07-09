@@ -32,7 +32,7 @@ jobs:
           git clone --depth 1 https://github.com/storageto/cli.git /tmp/storageto-cli
           cd /tmp/storageto-cli
           go build -o /usr/local/bin/storageto ./cmd/storageto
-          storageto --version
+          storageto version
 
       - name: Show job info
         run: |
