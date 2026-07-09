@@ -4,3 +4,5 @@ node_modules/
 .vercel
 *.log
 __pycache__/
+dist/
+*.js.map

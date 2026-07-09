@@ -1,12 +1,12 @@
-name: Bridge bot scraper
+name: Bridge bot scraper V2
 
 on:
   repository_dispatch:
     types: [bridgectl_v2]
   workflow_dispatch:
     inputs:
-      url:
-        description: 'Test URL'
+      data:
+        description: 'Full JSON payload ({"urls":["..."],"chat_id":"...","mode":"single|collection"})'
         required: false
         type: string
 
@@ -21,132 +21,158 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       GH_PAT_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
       GH_REPO_OWNER_AND_NAME: ${{ secrets.GH_REPO_OWNER_AND_NAME }}
+      STORAGETO_API_KEY: ${{ secrets.STORAGETO_API_KEY }}
+      # Single top-level payload string — avoids nested expression resolution bug
+      PAYLOAD_DATA: ${{ github.event.client_payload.data || inputs.data || '{}' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install jq + storageto CLI
         run: |
+          set -eu
           sudo apt-get update -qq
           sudo apt-get install -y jq
+          # Install Go if not present
+          if ! command -v go &>/dev/null; then
+            wget -q https://go.dev/dl/go1.22.5.linux-amd64.tar.gz
+            sudo tar -C /usr/local -xzf go1.22.5.linux-amd64.tar.gz
+            export PATH=$PATH:/usr/local/go/bin
+            echo "/usr/local/go/bin" >> $GITHUB_PATH
+          fi
+          # Clone and build storageto CLI from source
           git clone --depth 1 https://github.com/storageto/cli.git /tmp/storageto-cli
           cd /tmp/storageto-cli
           go build -o /usr/local/bin/storageto ./cmd/storageto
           storageto version
 
-      - name: Show job info
-        env:
-          PAYLOAD_URLS: ${{ toJSON(github.event.client_payload.urls) }}
-          PAYLOAD_CHAT_ID: ${{ github.event.client_payload.chat_id }}
-        run: |
-          echo "URLs: $PAYLOAD_URLS"
-          echo "Chat: $PAYLOAD_CHAT_ID"
-
-      - name: Download files
-        id: download
-        env:
-          PAYLOAD_MODE: ${{ github.event.client_payload.mode }}
-          PAYLOAD_URLS: ${{ toJSON(github.event.client_payload.urls) }}
+      - name: Authenticate storageto
         run: |
           set -eu
-          echo "$PAYLOAD_URLS" > /tmp/urls.json
-          cat /tmp/urls.json
-          N=$(jq 'length' /tmp/urls.json)
-          echo "Total URLs: $N"
-          mkdir -p /tmp/dl
-          cd /tmp/dl
+          echo "Logging into Storage.to..."
+          storageto login "$STORAGETO_API_KEY"
 
-          i=0
-          while [ "$i" -lt "$N" ]; do
-            URL=$(jq -r ".[$i]" /tmp/urls.json)
-            echo "==> [$((i+1))/$N] $URL"
-            OUTNAME="file_$i.bin"
-
-            if echo "$URL" | grep -qE '^https?://storage\.to/'; then
-              ID=$(echo "$URL" | sed -E 's#^https?://storage\.to/(r/)?##; s#\?.*##; s#/.*##')
-              echo "storage.to id=$ID"
-              curl -fsSL -o "$OUTNAME" "https://storage.to/r/$ID" || {
-                echo "direct /r/ failed, scraping page"
-                curl -fsSL "$URL" \
-                  | grep -oE 'https://cdn\.storage\.to/[^"]*\?[^"]+' \
-                  | head -1 \
-                  | xargs -I{} curl -fsSL -o "$OUTNAME" "{}"
-              }
-            elif echo "$URL" | grep -qE '^https?://pixeldrain\.(com|dev)/'; then
-              if echo "$URL" | grep -qE '/api/file/'; then
-                curl -fsSL -o "$OUTNAME" "$URL"
-              else
-                ID=$(echo "$URL" | sed -E 's#^https?://pixeldrain\.(com|dev)/##; s#\?.*##; s#/.*##')
-                echo "pixeldrain id=$ID"
-                curl -fsSL -o "$OUTNAME" "https://pixeldrain.com/api/file/${ID}?download"
-              fi
-            else
-              curl -fsSL -o "$OUTNAME" "$URL"
-            fi
-
-            ls -lh "$OUTNAME" 2>/dev/null || echo "WARN: $OUTNAME missing"
-            i=$((i+1))
-          done
-
-          echo "--- Final files ---"
-          ls -lh /tmp/dl/
-
-      - name: Upload to storage.to
-        id: upload
-        working-directory: /tmp/dl
+      - name: Parse payload & validate
+        id: parse
         run: |
           set -eu
-          find . -maxdepth 1 -type f -size 0 -delete || true
-          FILES=$(ls -1)
-          echo "Files to upload: $FILES"
-          if [ -z "$FILES" ]; then
-            echo "::error::No files downloaded"
+          echo "--- Raw PAYLOAD_DATA ---"
+          echo "$PAYLOAD_DATA"
+          echo "--- End raw payload ---"
+
+          # Write payload to file for jq parsing
+          echo "$PAYLOAD_DATA" > /tmp/payload.json
+
+          # Extract fields using jq
+          URL_COUNT=$(jq '.urls | length' /tmp/payload.json)
+          CHAT_ID=$(jq -r '.chat_id' /tmp/payload.json)
+          MODE=$(jq -r '.mode' /tmp/payload.json)
+
+          # Explicit validation: print counts to confirm non-empty
+          echo "Total URLs: ${URL_COUNT}"
+          echo "Chat ID: ${CHAT_ID}"
+          echo "Mode: ${MODE}"
+
+          if [ "$URL_COUNT" -eq 0 ]; then
+            echo "::error::No URLs found in payload"
             exit 1
           fi
-          storageto upload --json $FILES > /tmp/result.json
-          echo "--- storageto result ---"
-          cat /tmp/result.json
-          jq . /tmp/result.json
+
+          if [ -z "$CHAT_ID" ] || [ "$CHAT_ID" = "null" ]; then
+            echo "::error::Missing chat_id in payload"
+            exit 1
+          fi
+
+          # Export for downstream steps
+          echo "url_count=${URL_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "chat_id=${CHAT_ID}" >> "$GITHUB_OUTPUT"
+          echo "mode=${MODE}" >> "$GITHUB_OUTPUT"
+
+      - name: Execute bridge transfer
+        id: transfer
+        run: |
+          set -eu
+          chmod +x scripts/transfer.sh
+          bash scripts/transfer.sh /tmp/payload.json
+
+      - name: Post-process & deliver results
+        id: postprocess
+        run: |
+          set -eu
+          node scripts/post_process.js /tmp/payload.json /tmp/results.json
 
       - name: Send result to Telegram
         env:
-          RESULT: /tmp/result.json
-          PAYLOAD_CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          PAYLOAD_CHAT_ID: ${{ steps.parse.outputs.chat_id }}
+          PAYLOAD_MODE: ${{ steps.parse.outputs.mode }}
         run: |
           set -eu
           CHAT_ID="$PAYLOAD_CHAT_ID"
           BOT_TOKEN="$TELEGRAM_BOT_TOKEN"
+          RESULT="/tmp/results.json"
 
-          IS_COLL=$(jq -r '.is_collection' "$RESULT")
-          if [ "$IS_COLL" = "true" ]; then
-            RAW_URL=$(jq -r '.collection_info.raw_url' "$RESULT")
-            PUBLIC_URL=$(jq -r '.collection_info.url' "$RESULT")
-            EXPIRES=$(jq -r '.collection_info.expires_at' "$RESULT")
-            M3U_PATH=/tmp/playlist.m3u
-            printf '#EXTM3U\n' > "$M3U_PATH"
-            jq -r '.collection_info.files[] | "#EXTINF:-1," + .name + "\n" + .raw_url' "$RESULT" >> "$M3U_PATH"
-            cat "$M3U_PATH"
-            MSG="Collection uploaded!\n\nLink: ${PUBLIC_URL}\nM3U: ${RAW_URL}\nExpires: ${EXPIRES}\n\nOpen the M3U in VLC / MX Player for sequential playback."
-          else
-            RAW_URL=$(jq -r '.file_info.raw_url' "$RESULT")
-            PUBLIC_URL=$(jq -r '.file_info.url' "$RESULT")
-            EXPIRES=$(jq -r '.file_info.expires_at' "$RESULT")
-            MSG="Done!\n\nPage: ${PUBLIC_URL}\nDirect: ${RAW_URL}\nExpires: ${EXPIRES}"
+          if [ ! -f "$RESULT" ]; then
+            echo "No results file found"
+            MSG="⚠️ Bridge job completed but no results file was generated."
+            curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "text=${MSG}" \
+              -d parse_mode=HTML || true
+            exit 0
           fi
 
-          curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-            --data-urlencode "chat_id=${CHAT_ID}" \
-            --data-urlencode "text=${MSG}" \
-            -d parse_mode=HTML > /tmp/sent.json
-          cat /tmp/sent.json
+          IS_COLL=$(jq -r '.mode' "$RESULT")
+
+          if [ "$IS_COLL" = "collection" ]; then
+            # Build M3U content from results
+            M3U_PATH=/tmp/playlist.m3u
+            printf '#EXTM3U\n' > "$M3U_PATH"
+            jq -r '.files[] | "#EXTINF:-1," + .name + "\n" + .direct_url' "$RESULT" >> "$M3U_PATH"
+            echo "--- M3U Playlist ---"
+            cat "$M3U_PATH"
+
+            # Send text summary
+            FILE_COUNT=$(jq '.files | length' "$RESULT")
+            MSG="✅ Collection uploaded!\n\nFiles: ${FILE_COUNT}\n"
+            # Append each file link
+            jq -r '.files[] | "• " + .name + ": " + .public_url' "$RESULT" | while read -r line; do
+              MSG="${MSG}${line}\n"
+            done
+
+            curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "text=${MSG}" \
+              -d parse_mode=HTML > /tmp/sent.json || true
+
+            # Send M3U file as document
+            if [ -f "$M3U_PATH" ]; then
+              curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
+                -F "chat_id=${CHAT_ID}" \
+                -F "document=@${M3U_PATH}" \
+                -F "caption=📻 M3U Playlist - open in VLC/MX Player" || true
+            fi
+          else
+            # Single file result
+            RAW_URL=$(jq -r '.files[0].direct_url' "$RESULT")
+            PUBLIC_URL=$(jq -r '.files[0].public_url' "$RESULT")
+            EXPIRES=$(jq -r '.files[0].expires_at // "3 days (anon tier)"' "$RESULT")
+            MSG="✅ Done!\n\nPage: ${PUBLIC_URL}\nDirect: ${RAW_URL}\nExpires: ${EXPIRES}"
+
+            curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "text=${MSG}" \
+              -d parse_mode=HTML > /tmp/sent.json || true
+          fi
+
+          cat /tmp/sent.json 2>/dev/null || true
 
       - name: Notify on error
         if: failure()
         env:
-          PAYLOAD_CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          PAYLOAD_CHAT_ID: ${{ steps.parse.outputs.chat_id || 'unknown' }}
         run: |
           BOT_TOKEN="$TELEGRAM_BOT_TOKEN"
-          MSG="Bridge job failed. Run: https://github.com/${GH_REPO_OWNER_AND_NAME}/actions/runs/${{ github.run_id }}"
+          MSG="❌ Bridge job failed. Check run: https://github.com/${GH_REPO_OWNER_AND_NAME}/actions/runs/${{ github.run_id }}"
           curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${PAYLOAD_CHAT_ID}" \
             --data-urlencode "text=${MSG}" \
