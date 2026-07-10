@@ -107,7 +107,7 @@ jobs:
         id: postprocess
         run: |
           set -eu
-          node scripts/post_process.js /tmp/payload.json /tmp/results.json
+          node scripts/post_process.cjs /tmp/payload.json /tmp/results.json
 
       - name: Notify on error
         if: failure()
