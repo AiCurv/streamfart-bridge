@@ -28,29 +28,37 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install jq + storageto CLI
+      - name: Install jq + build storageto CLI from source
         run: |
           set -eu
           sudo apt-get update -qq
           sudo apt-get install -y jq
-          # Install Go if not present
-          if ! command -v go &>/dev/null; then
-            wget -q https://go.dev/dl/go1.22.5.linux-amd64.tar.gz
-            sudo tar -C /usr/local -xzf go1.22.5.linux-amd64.tar.gz
-            export PATH=$PATH:/usr/local/go/bin
-            echo "/usr/local/go/bin" >> $GITHUB_PATH
-          fi
-          # Clone and build storageto CLI from source
+          # Go is pre-installed on ubuntu-latest; verify
+          go version
+          # Clone and build storageto CLI from the public repository
           git clone --depth 1 https://github.com/storageto/cli.git /tmp/storageto-cli
           cd /tmp/storageto-cli
           go build -o /usr/local/bin/storageto ./cmd/storageto
           storageto version
 
-      - name: Authenticate storageto
+      - name: Configure storageto authentication
         run: |
           set -eu
-          echo "Logging into Storage.to..."
-          storageto login "$STORAGETO_API_KEY"
+          # The storageto CLI has no "login" subcommand.
+          # It reads a visitor token from ~/.config/storageto/token.
+          # If STORAGETO_API_KEY is a Laravel/Sanctum PAT (format: "366|..."),
+          # we inject it as the visitor token for authenticated uploads.
+          # If not set, the CLI auto-generates an anonymous token on first use.
+          CONFIG_DIR="$HOME/.config/storageto"
+          mkdir -p "$CONFIG_DIR"
+          if [ -n "$STORAGETO_API_KEY" ] && [ "$STORAGETO_API_KEY" != "" ]; then
+            echo "Injecting Sanctum token as storageto visitor token..."
+            echo "$STORAGETO_API_KEY" > "$CONFIG_DIR/token"
+            chmod 600 "$CONFIG_DIR/token"
+            echo "Token written to $CONFIG_DIR/token (length: $(wc -c < "$CONFIG_DIR/token"))"
+          else
+            echo "No STORAGETO_API_KEY set — storageto will use anonymous mode"
+          fi
 
       - name: Parse payload & validate
         id: parse
@@ -66,7 +74,7 @@ jobs:
           # Extract fields using jq
           URL_COUNT=$(jq '.urls | length' /tmp/payload.json)
           CHAT_ID=$(jq -r '.chat_id' /tmp/payload.json)
-          MODE=$(jq -r '.mode' /tmp/payload.json)
+          MODE=$(jq -r '.mode // "single"' /tmp/payload.json)
 
           # Explicit validation: print counts to confirm non-empty
           echo "Total URLs: ${URL_COUNT}"
@@ -95,76 +103,11 @@ jobs:
           chmod +x scripts/transfer.sh
           bash scripts/transfer.sh /tmp/payload.json
 
-      - name: Post-process & deliver results
+      - name: Post-process & deliver results to Telegram
         id: postprocess
         run: |
           set -eu
           node scripts/post_process.js /tmp/payload.json /tmp/results.json
-
-      - name: Send result to Telegram
-        env:
-          PAYLOAD_CHAT_ID: ${{ steps.parse.outputs.chat_id }}
-          PAYLOAD_MODE: ${{ steps.parse.outputs.mode }}
-        run: |
-          set -eu
-          CHAT_ID="$PAYLOAD_CHAT_ID"
-          BOT_TOKEN="$TELEGRAM_BOT_TOKEN"
-          RESULT="/tmp/results.json"
-
-          if [ ! -f "$RESULT" ]; then
-            echo "No results file found"
-            MSG="⚠️ Bridge job completed but no results file was generated."
-            curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${CHAT_ID}" \
-              --data-urlencode "text=${MSG}" \
-              -d parse_mode=HTML || true
-            exit 0
-          fi
-
-          IS_COLL=$(jq -r '.mode' "$RESULT")
-
-          if [ "$IS_COLL" = "collection" ]; then
-            # Build M3U content from results
-            M3U_PATH=/tmp/playlist.m3u
-            printf '#EXTM3U\n' > "$M3U_PATH"
-            jq -r '.files[] | "#EXTINF:-1," + .name + "\n" + .direct_url' "$RESULT" >> "$M3U_PATH"
-            echo "--- M3U Playlist ---"
-            cat "$M3U_PATH"
-
-            # Send text summary
-            FILE_COUNT=$(jq '.files | length' "$RESULT")
-            MSG="✅ Collection uploaded!\n\nFiles: ${FILE_COUNT}\n"
-            # Append each file link
-            jq -r '.files[] | "• " + .name + ": " + .public_url' "$RESULT" | while read -r line; do
-              MSG="${MSG}${line}\n"
-            done
-
-            curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${CHAT_ID}" \
-              --data-urlencode "text=${MSG}" \
-              -d parse_mode=HTML > /tmp/sent.json || true
-
-            # Send M3U file as document
-            if [ -f "$M3U_PATH" ]; then
-              curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
-                -F "chat_id=${CHAT_ID}" \
-                -F "document=@${M3U_PATH}" \
-                -F "caption=📻 M3U Playlist - open in VLC/MX Player" || true
-            fi
-          else
-            # Single file result
-            RAW_URL=$(jq -r '.files[0].direct_url' "$RESULT")
-            PUBLIC_URL=$(jq -r '.files[0].public_url' "$RESULT")
-            EXPIRES=$(jq -r '.files[0].expires_at // "3 days (anon tier)"' "$RESULT")
-            MSG="✅ Done!\n\nPage: ${PUBLIC_URL}\nDirect: ${RAW_URL}\nExpires: ${EXPIRES}"
-
-            curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${CHAT_ID}" \
-              --data-urlencode "text=${MSG}" \
-              -d parse_mode=HTML > /tmp/sent.json || true
-          fi
-
-          cat /tmp/sent.json 2>/dev/null || true
 
       - name: Notify on error
         if: failure()

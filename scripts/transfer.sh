@@ -1,25 +1,11 @@
 #!/usr/bin/env bash
-# ─────────────────────────────────────────────────────────────────
-# Core High-Speed Bridge Transmission Script
-# ─────────────────────────────────────────────────────────────────
-# Reads the flattened JSON payload, downloads each URL via curl,
-# uploads to Storage.to via CLI, and harvests the JSON response links.
-#
-# SAFETY: Individual file cap at 8GB to protect the 14GB free runner
-# disk. Files are aggressively deleted after upload to prevent
-# out-of-disk termination.
-#
-# Usage: bash scripts/transfer.sh /tmp/payload.json
-# ─────────────────────────────────────────────────────────────────
-
 set -euo pipefail
 
 PAYLOAD="$1"
-MAX_FILE_SIZE_BYTES=$((8 * 1024 * 1024 * 1024))  # 8 GB cap
+MAX_FILE_SIZE_BYTES=$((8 * 1024 * 1024 * 1024))
 DL_DIR="/tmp/dl"
 RESULTS_JSON="/tmp/results.json"
 
-# ─── Parse payload ───
 URL_COUNT=$(jq '.urls | length' "$PAYLOAD")
 CHAT_ID=$(jq -r '.chat_id' "$PAYLOAD")
 MODE=$(jq -r '.mode // "single"' "$PAYLOAD")
@@ -35,14 +21,10 @@ if [ "$URL_COUNT" -eq 0 ]; then
   exit 1
 fi
 
-# ─── Prepare directories ───
 rm -rf "$DL_DIR"
 mkdir -p "$DL_DIR"
-
-# Initialize results JSON
 echo '{"mode":"'"$MODE"'","chat_id":"'"$CHAT_ID"'","files":[]}' > "$RESULTS_JSON"
 
-# ─── Function: send Telegram alert ───
 send_alert() {
   local msg="$1"
   if [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$CHAT_ID" ] && [ "$CHAT_ID" != "null" ]; then
@@ -53,17 +35,15 @@ send_alert() {
   fi
 }
 
-# ─── Function: check disk space ───
 check_disk() {
   local available
-  available=$(df /tmp | awk 'NR==2{print $4 * 1024}')  # in bytes
+  available=$(df /tmp | awk 'NR==2{print $4 * 1024}')
   if [ "$available" -lt $((2 * 1024 * 1024 * 1024)) ]; then
     echo "WARNING: Low disk space: $(numfmt --to=iec "$available")"
-    send_alert "⚠️ Runner disk space low: $(numfmt --to=iec "$available") remaining. Bridge may fail."
+    send_alert "⚠️ Runner disk space low: $(numfmt --to=iec "$available") remaining."
   fi
 }
 
-# ─── Main download + upload loop ───
 i=0
 while [ "$i" -lt "$URL_COUNT" ]; do
   URL=$(jq -r ".urls[$i]" "$PAYLOAD")
@@ -72,36 +52,26 @@ while [ "$i" -lt "$URL_COUNT" ]; do
 
   TMP_FILE="${DL_DIR}/file_${i}.bin"
 
-  # ── Download ──
   echo "    Downloading..."
   HTTP_CODE=$(curl -L -o "$TMP_FILE" -w "%{http_code}" -fsSL --connect-timeout 30 --max-time 3600 "$URL" 2>/dev/null || true)
 
   if [ ! -f "$TMP_FILE" ] || [ ! -s "$TMP_FILE" ]; then
-    echo "    ERROR: Download failed or empty file (HTTP $HTTP_CODE)"
-    # For storage.to URLs, try scraping the page for CDN link
+    echo "    ERROR: Download failed or empty (HTTP $HTTP_CODE)"
     if echo "$URL" | grep -qE '^https?://storage\.to/'; then
-      echo "    Attempting storage.to page scrape..."
       FILE_ID=$(echo "$URL" | sed -E 's#^https?://storage\.to/(r/)?##; s#\?.*##; s#/.*##')
-      CDN_URL=$(curl -fsSL "https://storage.to/$FILE_ID" 2>/dev/null \
-        | grep -oE 'https://cdn\.storage\.to/[^"]*\?[^"]+' \
-        | head -1 || true)
+      CDN_URL=$(curl -fsSL "https://storage.to/$FILE_ID" 2>/dev/null | grep -oE 'https://cdn\.storage\.to/[^"]*\?[^"]+' | head -1 || true)
       if [ -n "$CDN_URL" ]; then
-        echo "    Found CDN URL, retrying download..."
         curl -L -o "$TMP_FILE" -fsSL --connect-timeout 30 --max-time 3600 "$CDN_URL" || true
       fi
     fi
-
-    # For pixeldrain URLs, use API download
     if echo "$URL" | grep -qE '^https?://pixeldrain\.(com|dev)/'; then
       if ! echo "$URL" | grep -qE '/api/file/'; then
         PD_ID=$(echo "$URL" | sed -E 's#^https?://pixeldrain\.(com|dev)/##; s#\?.*##; s#/.*##')
-        echo "    Pixeldrain API download for id=$PD_ID"
         curl -L -o "$TMP_FILE" -fsSL "https://pixeldrain.com/api/file/${PD_ID}?download" || true
       fi
     fi
   fi
 
-  # ── Validate downloaded file ──
   if [ ! -f "$TMP_FILE" ] || [ ! -s "$TMP_FILE" ]; then
     echo "    SKIP: Could not download $URL"
     send_alert "❌ Failed to download: $URL"
@@ -111,71 +81,110 @@ while [ "$i" -lt "$URL_COUNT" ]; do
 
   FILE_SIZE=$(stat -c%s "$TMP_FILE" 2>/dev/null || echo "0")
   FILE_SIZE_HUMAN=$(numfmt --to=iec "$FILE_SIZE")
-  echo "    Downloaded: $FILE_SIZE_HUMAN (HTTP $HTTP_CODE)"
+  echo "    Downloaded: $FILE_SIZE_HUMAN"
 
-  # ── Size cap check (8GB limit) ──
   if [ "$FILE_SIZE" -gt "$MAX_FILE_SIZE_BYTES" ]; then
-    echo "    CAP HIT: File exceeds 8GB limit ($FILE_SIZE_HUMAN). Skipping upload."
-    send_alert "⚠️ File from $URL exceeds 8GB cap ($FILE_SIZE_HUMAN). Skipped to protect runner disk."
+    echo "    CAP HIT: File exceeds 8GB ($FILE_SIZE_HUMAN). Skipping."
+    send_alert "⚠️ File exceeds 8GB cap ($FILE_SIZE_HUMAN). Skipped."
     rm -f "$TMP_FILE"
     i=$((i+1))
     continue
   fi
 
-  # ── Upload to Storage.to ──
+  # Try to detect filename from URL or Content-Disposition
+  DETECTED_NAME=$(basename "$URL" | sed 's/[?].*//' | sed 's/%20/ /g')
+  if [ -z "$DETECTED_NAME" ] || [ "$DETECTED_NAME" = "/" ] || [ ${#DETECTED_NAME} -gt 200 ]; then
+    DETECTED_NAME="file_${i}.bin"
+  fi
+  # Rename to detected name for better storageto metadata
+  mv "$TMP_FILE" "${DL_DIR}/${DETECTED_NAME}" 2>/dev/null || true
+  UPLOAD_FILE="${DL_DIR}/${DETECTED_NAME}"
+  if [ ! -f "$UPLOAD_FILE" ]; then
+    UPLOAD_FILE="$TMP_FILE"
+  fi
+
   echo "    Uploading to Storage.to..."
   UPLOAD_OUTPUT="${DL_DIR}/upload_${i}.json"
+  UPLOAD_ERR="${DL_DIR}/upload_${i}_err.txt"
 
-  # storageto upload --json does NOT support stdin piping; must use file path
-  if storageto upload --json "$TMP_FILE" > "$UPLOAD_OUTPUT" 2>&1; then
+  if storageto upload --json "$UPLOAD_FILE" > "$UPLOAD_OUTPUT" 2> "$UPLOAD_ERR"; then
     echo "    Upload succeeded"
-    cat "$UPLOAD_OUTPUT"
   else
-    echo "    Upload FAILED"
+    EXIT_CODE=$?
+    echo "    Upload FAILED (exit=$EXIT_CODE)"
+    cat "$UPLOAD_ERR" 2>/dev/null || true
     cat "$UPLOAD_OUTPUT" 2>/dev/null || true
     send_alert "❌ Upload failed for: $URL"
-    rm -f "$TMP_FILE"
+    rm -f "$UPLOAD_FILE" "$TMP_FILE" "$UPLOAD_OUTPUT" "$UPLOAD_ERR"
     i=$((i+1))
     continue
   fi
 
-  # ── Harvest upload result ──
-  # Parse the storageto CLI JSON output for direct + public URLs
+  # Parse storageto upload --json output
+  # Single file: { "file_info": { "id", "url", "raw_url", "filename", "size", "human_size", "expires_at" } }
+  # Collection:  { "collection_info": { "id", "url", "expires_at" }, "is_collection": true,
+  #                "files": [ { "id", "url", "raw_url", "filename", ... } ] }
   DIRECT_URL=""
   PUBLIC_URL=""
   EXPIRES_AT=""
   FILE_NAME=""
 
   if [ -f "$UPLOAD_OUTPUT" ] && jq -e . "$UPLOAD_OUTPUT" >/dev/null 2>&1; then
-    # Try file_info (single file response)
+    echo "    Raw storageto output:"
+    cat "$UPLOAD_OUTPUT"
+
     if jq -e '.file_info' "$UPLOAD_OUTPUT" >/dev/null 2>&1; then
       DIRECT_URL=$(jq -r '.file_info.raw_url // empty' "$UPLOAD_OUTPUT")
       PUBLIC_URL=$(jq -r '.file_info.url // empty' "$UPLOAD_OUTPUT")
       EXPIRES_AT=$(jq -r '.file_info.expires_at // "3 days"' "$UPLOAD_OUTPUT")
-      FILE_NAME=$(jq -r '.file_info.name // "unknown"' "$UPLOAD_OUTPUT")
-    # Try collection response
-    elif jq -e '.collection_info' "$UPLOAD_OUTPUT" >/dev/null 2>&1; then
+      FILE_NAME=$(jq -r '.file_info.filename // .file_info.name // "unknown"' "$UPLOAD_OUTPUT")
+    elif jq -e '.is_collection' "$UPLOAD_OUTPUT" >/dev/null 2>&1; then
+      # Multi-file collection uploaded at once
+      # The collection_info has the aggregate URL
       PUBLIC_URL=$(jq -r '.collection_info.url // empty' "$UPLOAD_OUTPUT")
-      DIRECT_URL=$(jq -r '.collection_info.raw_url // empty' "$UPLOAD_OUTPUT")
       EXPIRES_AT=$(jq -r '.collection_info.expires_at // "3 days"' "$UPLOAD_OUTPUT")
-      FILE_NAME=$(jq -r '.collection_info.name // "collection"' "$UPLOAD_OUTPUT")
+      FILE_NAME="collection"
+      # Extract per-file details from the collection
+      FILE_COUNT=$(jq '.files | length' "$UPLOAD_OUTPUT" 2>/dev/null || echo "0")
+      ci=0
+      while [ "$ci" -lt "$FILE_COUNT" ]; do
+        F_NAME=$(jq -r ".files[$ci].filename // .files[$ci].name // \"file_$ci\"" "$UPLOAD_OUTPUT")
+        F_PUBLIC=$(jq -r ".files[$ci].url // empty" "$UPLOAD_OUTPUT")
+        F_DIRECT=$(jq -r ".files[$ci].raw_url // empty" "$UPLOAD_OUTPUT")
+        F_EXPIRES=$(jq -r ".files[$ci].expires_at // \"3 days\"" "$UPLOAD_OUTPUT")
+
+        RESULTS_TEMP="${DL_DIR}/results_tmp.json"
+        jq --arg name "$F_NAME" \
+           --arg public_url "$F_PUBLIC" \
+           --arg direct_url "$F_DIRECT" \
+           --arg expires_at "$F_EXPIRES" \
+           '.files += [{"name": $name, "public_url": $public_url, "direct_url": $direct_url, "expires_at": $expires_at}]' \
+           "$RESULTS_JSON" > "$RESULTS_TEMP"
+        mv "$RESULTS_TEMP" "$RESULTS_JSON"
+
+        ci=$((ci+1))
+      done
+
+      # For collection, we already added all files above; skip the single-file append below
+      rm -f "$UPLOAD_FILE" "$TMP_FILE" "$UPLOAD_OUTPUT" "$UPLOAD_ERR"
+      check_disk
+      i=$((i+1))
+      continue
     else
-      # Generic: try to extract any useful fields
-      DIRECT_URL=$(jq -r '.raw_url // .direct_url // .url // empty' "$UPLOAD_OUTPUT")
-      PUBLIC_URL=$(jq -r '.public_url // .url // .page_url // empty' "$UPLOAD_OUTPUT")
-      FILE_NAME=$(jq -r '.name // .filename // "file_'"$i"'"' "$UPLOAD_OUTPUT")
+      # Fallback: try generic fields
+      DIRECT_URL=$(jq -r '.raw_url // .direct_url // empty' "$UPLOAD_OUTPUT")
+      PUBLIC_URL=$(jq -r '.url // .public_url // empty' "$UPLOAD_OUTPUT")
+      FILE_NAME=$(jq -r '.filename // .name // "file_'"$i"'"' "$UPLOAD_OUTPUT")
       EXPIRES_AT="3 days"
     fi
   fi
 
-  # Fallback: derive name from URL
   if [ -z "$FILE_NAME" ] || [ "$FILE_NAME" = "null" ]; then
-    FILE_NAME="file_${i}"
+    FILE_NAME="$DETECTED_NAME"
   fi
 
-  echo "    Result: $PUBLIC_URL -> $DIRECT_URL"
+  echo "    Result: name=$FILE_NAME public=$PUBLIC_URL direct=$DIRECT_URL"
 
-  # ── Append to results JSON ──
   RESULTS_TEMP="${DL_DIR}/results_tmp.json"
   jq --arg name "$FILE_NAME" \
      --arg public_url "$PUBLIC_URL" \
@@ -185,25 +194,17 @@ while [ "$i" -lt "$URL_COUNT" ]; do
      "$RESULTS_JSON" > "$RESULTS_TEMP"
   mv "$RESULTS_TEMP" "$RESULTS_JSON"
 
-  # ── Aggressive cleanup: delete downloaded file immediately ──
-  echo "    Cleaning up: $TMP_FILE"
-  rm -f "$TMP_FILE"
-  rm -f "$UPLOAD_OUTPUT"
+  echo "    Cleaning up: $UPLOAD_FILE"
+  rm -f "$UPLOAD_FILE" "$TMP_FILE" "$UPLOAD_OUTPUT" "$UPLOAD_ERR"
 
-  # ── Check disk space after each file ──
   check_disk
-
   i=$((i+1))
 done
 
-# ─── Final summary ───
 echo ""
 echo "=== Transfer Complete ==="
 TOTAL_UPLOADED=$(jq '.files | length' "$RESULTS_JSON")
 echo "Successfully uploaded: $TOTAL_UPLOADED / $URL_COUNT files"
 cat "$RESULTS_JSON"
-
-# Clean up download directory
 rm -rf "$DL_DIR"
-
 echo "=== Done ==="

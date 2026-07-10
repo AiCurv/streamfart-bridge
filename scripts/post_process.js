@@ -1,32 +1,25 @@
 #!/usr/bin/env node
 /**
- * ─────────────────────────────────────────────────────────────────
  * M3U Playlist Scraping & Post-Processing Engine
- * ─────────────────────────────────────────────────────────────────
  *
  * Reads the transfer results, extracts direct stream URLs from
  * Storage.to landing pages (via cheerio HTML parsing), and builds
  * a standard #EXTM3U playlist file for multi-file transactions.
  *
- * For single files: sends the direct link back to Telegram.
- * For collections: aggregates into .m3u and sends as document.
- *
  * Usage: node scripts/post_process.js <payload.json> <results.json>
- * ─────────────────────────────────────────────────────────────────
  */
 
 const fs = require('fs');
 const https = require('https');
 const http = require('http');
+const { execSync } = require('child_process');
 
-// ─── Argument validation ───
 const [,, payloadPath, resultsPath] = process.argv;
 if (!payloadPath || !resultsPath) {
   console.error('Usage: node post_process.js <payload.json> <results.json>');
   process.exit(1);
 }
 
-// ─── Load data ───
 const payload = JSON.parse(fs.readFileSync(payloadPath, 'utf8'));
 const results = JSON.parse(fs.readFileSync(resultsPath, 'utf8'));
 
@@ -36,14 +29,13 @@ const mode = payload.mode || results.mode || 'single';
 console.log(`Post-process: mode=${mode}, files=${results.files?.length || 0}, chat_id=${chatId}`);
 
 /**
- * Fetch HTML content from a URL (Node.js native, no axios dependency needed).
+ * Fetch HTML content from a URL.
  */
 function fetchHtml(url) {
   return new Promise((resolve, reject) => {
     const mod = url.startsWith('https') ? https : http;
     const timeout = setTimeout(() => reject(new Error('Fetch timeout')), 30000);
     mod.get(url, { headers: { 'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36' } }, (res) => {
-      // Follow redirects
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         clearTimeout(timeout);
         return fetchHtml(res.headers.location).then(resolve).catch(reject);
@@ -58,62 +50,64 @@ function fetchHtml(url) {
 
 /**
  * Extract direct streaming URL from a Storage.to landing page.
- * Parses the HTML for <video>, <source>, or <iframe> elements that
- * reference CDN endpoints. Uses simple regex-based extraction to
- * avoid heavy cheerio dependency in the runner environment.
+ * Uses cheerio if available, falls back to regex-based extraction.
  */
 async function extractDirectUrl(publicUrl) {
   if (!publicUrl || publicUrl === 'null') return null;
-
-  // If it's already a direct/cdn URL, return as-is
-  if (publicUrl.includes('cdn.storage.to') || publicUrl.includes('/r/')) {
-    return publicUrl;
-  }
-
-  // Only scrape storage.to pages
-  if (!publicUrl.includes('storage.to')) {
-    return publicUrl;
-  }
+  if (publicUrl.includes('cdn.storage.to') || publicUrl.includes('/r/')) return publicUrl;
+  if (!publicUrl.includes('storage.to')) return publicUrl;
 
   try {
     console.log(`  Scraping landing page: ${publicUrl}`);
     const html = await fetchHtml(publicUrl);
 
-    // Strategy 1: Look for <video> or <source> src attributes with CDN URLs
-    let match = html.match(/<source[^>]+src=["']([^"']*cdn\.storage\.to[^"']*)["']/i);
-    if (match) {
-      console.log(`  Found CDN URL via <source>: ${match[1]}`);
-      return match[1].replace(/&amp;/g, '&');
+    // Try cheerio first (if installed)
+    try {
+      const cheerio = require('cheerio');
+      const $ = cheerio.load(html);
+
+      // Check <video> -> <source> elements
+      const sourceUrl = $('video source').attr('src') ||
+                        $('video').attr('src') ||
+                        $('source[type^="video/"]').attr('src');
+      if (sourceUrl && sourceUrl.includes('cdn.storage.to')) {
+        console.log(`  Found CDN URL via cheerio <source>: ${sourceUrl}`);
+        return sourceUrl.replace(/&amp;/g, '&');
+      }
+
+      // Check <iframe> for embedded player
+      const iframeSrc = $('iframe').attr('src');
+      if (iframeSrc && iframeSrc.includes('storage.to')) {
+        console.log(`  Found iframe, following: ${iframeSrc}`);
+        const iframeHtml = await fetchHtml(iframeSrc);
+        const iframe$ = cheerio.load(iframeHtml);
+        const iSourceUrl = iframe$('video source').attr('src') || iframe$('video').attr('src');
+        if (iSourceUrl && iSourceUrl.includes('cdn.storage.to')) {
+          return iSourceUrl.replace(/&amp;/g, '&');
+        }
+      }
+    } catch (e) {
+      // cheerio not available, fall through to regex
     }
+
+    // Fallback: regex-based extraction
+    let match;
+    match = html.match(/<source[^>]+src=["']([^"']*cdn\.storage\.to[^"']*)["']/i);
+    if (match) return match[1].replace(/&amp;/g, '&');
 
     match = html.match(/<video[^>]+src=["']([^"']*cdn\.storage\.to[^"']*)["']/i);
-    if (match) {
-      console.log(`  Found CDN URL via <video>: ${match[1]}`);
-      return match[1].replace(/&amp;/g, '&');
-    }
+    if (match) return match[1].replace(/&amp;/g, '&');
 
-    // Strategy 2: Look for JavaScript variable assignments with CDN URLs
     match = html.match(/(?:src|url|streamUrl|videoUrl|file)\s*[:=]\s*["']([^"']*cdn\.storage\.to[^"']*)["']/i);
-    if (match) {
-      console.log(`  Found CDN URL via JS var: ${match[1]}`);
-      return match[1].replace(/&amp;/g, '&');
-    }
+    if (match) return match[1].replace(/&amp;/g, '&');
 
-    // Strategy 3: Look for any storage.to CDN URLs in the page
     match = html.match(/https?:\/\/cdn\.storage\.to\/[^\s"'<>]+/);
-    if (match) {
-      console.log(`  Found CDN URL via generic scan: ${match[0]}`);
-      return match[0].replace(/&amp;/g, '&');
-    }
+    if (match) return match[0].replace(/&amp;/g, '&');
 
-    // Strategy 4: Look for /r/ raw endpoint patterns
     match = html.match(/https?:\/\/storage\.to\/r\/[^\s"'<>]+/);
-    if (match) {
-      console.log(`  Found raw endpoint: ${match[0]}`);
-      return match[0].replace(/&amp;/g, '&');
-    }
+    if (match) return match[0].replace(/&amp;/g, '&');
 
-    console.log(`  No CDN URL found in landing page for: ${publicUrl}`);
+    console.log(`  No CDN URL found for: ${publicUrl}`);
     return null;
   } catch (err) {
     console.error(`  Scraping failed for ${publicUrl}: ${err.message}`);
@@ -122,7 +116,7 @@ async function extractDirectUrl(publicUrl) {
 }
 
 /**
- * Build a standard #EXTM3U playlist from an array of file objects.
+ * Build a standard #EXTM3U playlist.
  */
 function buildM3U(files) {
   let m3u = '#EXTM3U\n';
@@ -137,7 +131,7 @@ function buildM3U(files) {
 }
 
 /**
- * Send a text message via Telegram Bot API.
+ * Send a Telegram message.
  */
 function sendTelegramMessage(chatId, text) {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
@@ -164,7 +158,7 @@ function sendTelegramMessage(chatId, text) {
 }
 
 /**
- * Send a document (M3U file) via Telegram Bot API.
+ * Send a document via Telegram.
  */
 function sendTelegramDocument(chatId, m3uContent) {
   const botToken = process.env.TELEGRAM_BOT_TOKEN;
@@ -175,7 +169,7 @@ function sendTelegramDocument(chatId, m3uContent) {
 
   let body = '';
   body += `--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`;
-  body += `--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n📻 M3U Playlist — open in VLC / MX Player\r\n`;
+  body += `--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\nM3U Playlist - open in VLC / MX Player\r\n`;
   body += `--${boundary}\r\nContent-Disposition: form-data; name="document"; filename="playlist.m3u"\r\nContent-Type: audio/x-mpegurl\r\n\r\n`;
 
   const headerBuf = Buffer.from(body, 'utf8');
@@ -201,7 +195,7 @@ function sendTelegramDocument(chatId, m3uContent) {
   });
 }
 
-// ─── Main processing ───
+// ─── Main ───
 (async () => {
   try {
     const files = results.files || [];
@@ -210,23 +204,21 @@ function sendTelegramDocument(chatId, m3uContent) {
       process.exit(0);
     }
 
-    // For each file, try to extract the direct streaming URL
+    // Extract direct streaming URLs by scraping landing pages
     console.log(`\nExtracting direct URLs for ${files.length} file(s)...`);
     for (const file of files) {
-      // If direct_url is already set, skip scraping
       if (file.direct_url && file.direct_url !== 'null' && file.direct_url.includes('cdn')) {
-        console.log(`  ✓ ${file.name}: direct URL already present`);
+        console.log(`  ok ${file.name}: direct URL already present`);
         continue;
       }
 
       const extractedUrl = await extractDirectUrl(file.public_url);
       if (extractedUrl) {
         file.direct_url = extractedUrl;
-        console.log(`  ✓ ${file.name}: extracted ${extractedUrl}`);
+        console.log(`  ok ${file.name}: extracted ${extractedUrl}`);
       } else {
-        // Fallback: use public_url as direct_url
         file.direct_url = file.direct_url || file.public_url || '';
-        console.log(`  ⚠ ${file.name}: no CDN URL found, using fallback`);
+        console.log(`  warn ${file.name}: no CDN URL found, using fallback`);
       }
     }
 
@@ -234,37 +226,33 @@ function sendTelegramDocument(chatId, m3uContent) {
     fs.writeFileSync(resultsPath, JSON.stringify(results, null, 2));
     console.log(`\nUpdated results written to ${resultsPath}`);
 
-    // Build M3U if collection mode
+    // Build and send M3U for collections
     if (mode === 'collection' && files.length > 1) {
       const m3uContent = buildM3U(files);
       const m3uPath = '/tmp/playlist.m3u';
       fs.writeFileSync(m3uPath, m3uContent);
-      console.log(`\nM3U playlist written to ${m3uPath} (${files.length} entries)`);
-      console.log(m3uContent);
-
-      // Send M3U to Telegram
+      console.log(`\nM3U playlist written (${files.length} entries)`);
       await sendTelegramDocument(chatId, m3uContent);
     }
 
     // Send summary message
     if (mode === 'single' && files.length === 1) {
       const f = files[0];
-      const msg = `✅ Bridge complete!\n\n📄 Page: ${f.public_url}\n🔗 Direct: ${f.direct_url}\n⏰ Expires: ${f.expires_at || '3 days'}`;
+      const msg = `Bridge complete!\n\nPage: ${f.public_url}\nDirect: ${f.direct_url}\nExpires: ${f.expires_at || '3 days'}`;
       await sendTelegramMessage(chatId, msg);
     } else if (files.length > 1) {
-      let msg = `✅ Collection bridge complete! ${files.length} files uploaded.\n\n`;
+      let msg = `Collection bridge complete! ${files.length} files uploaded.\n\n`;
       for (const f of files) {
-        msg += `• ${f.name}: ${f.public_url}\n`;
+        msg += `- ${f.name}: ${f.public_url}\n`;
       }
-      msg += `\n📻 M3U playlist sent as attachment.`;
+      msg += `\nM3U playlist sent as attachment.`;
       await sendTelegramMessage(chatId, msg);
     }
 
     console.log('\nPost-processing complete');
   } catch (err) {
     console.error('Post-process error:', err);
-    // Attempt to notify about failure
-    await sendTelegramMessage(chatId, `❌ Post-processing failed: ${err.message}`).catch(() => {});
+    await sendTelegramMessage(chatId, `Post-processing failed: ${err.message}`).catch(() => {});
     process.exit(1);
   }
 })();
