@@ -107,7 +107,9 @@ while [ "$i" -lt "$URL_COUNT" ]; do
   UPLOAD_OUTPUT="${DL_DIR}/upload_${i}.json"
   UPLOAD_ERR="${DL_DIR}/upload_${i}_err.txt"
 
-  if storageto upload --json "$UPLOAD_FILE" > "$UPLOAD_OUTPUT" 2> "$UPLOAD_ERR"; then
+  # storageto upload: --no-token avoids invalid header from Sanctum tokens with pipe chars.
+  # The CLI will auto-generate an anonymous visitor token for 3-day expiry uploads.
+  if storageto upload --no-token --json "$UPLOAD_FILE" > "$UPLOAD_OUTPUT" 2> "$UPLOAD_ERR"; then
     echo "    Upload succeeded"
   else
     EXIT_CODE=$?

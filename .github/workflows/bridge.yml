@@ -28,37 +28,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install jq + build storageto CLI from source
+      - name: Build storageto CLI from source
         run: |
           set -eu
           sudo apt-get update -qq
           sudo apt-get install -y jq
-          # Go is pre-installed on ubuntu-latest; verify
           go version
-          # Clone and build storageto CLI from the public repository
           git clone --depth 1 https://github.com/storageto/cli.git /tmp/storageto-cli
           cd /tmp/storageto-cli
           go build -o /usr/local/bin/storageto ./cmd/storageto
           storageto version
-
-      - name: Configure storageto authentication
-        run: |
-          set -eu
-          # The storageto CLI has no "login" subcommand.
-          # It reads a visitor token from ~/.config/storageto/token.
-          # If STORAGETO_API_KEY is a Laravel/Sanctum PAT (format: "366|..."),
-          # we inject it as the visitor token for authenticated uploads.
-          # If not set, the CLI auto-generates an anonymous token on first use.
-          CONFIG_DIR="$HOME/.config/storageto"
-          mkdir -p "$CONFIG_DIR"
-          if [ -n "$STORAGETO_API_KEY" ] && [ "$STORAGETO_API_KEY" != "" ]; then
-            echo "Injecting Sanctum token as storageto visitor token..."
-            echo "$STORAGETO_API_KEY" > "$CONFIG_DIR/token"
-            chmod 600 "$CONFIG_DIR/token"
-            echo "Token written to $CONFIG_DIR/token (length: $(wc -c < "$CONFIG_DIR/token"))"
-          else
-            echo "No STORAGETO_API_KEY set — storageto will use anonymous mode"
-          fi
 
       - name: Parse payload & validate
         id: parse
