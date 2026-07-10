@@ -105,19 +105,50 @@ while [ "$i" -lt "$URL_COUNT" ]; do
 
   echo "    Uploading to Storage.to..."
   UPLOAD_OUTPUT="${DL_DIR}/upload_${i}.json"
-  UPLOAD_ERR="${DL_DIR}/upload_${i}_err.txt"
 
   # storageto upload: --no-token avoids invalid header from Sanctum tokens with pipe chars.
-  # The CLI will auto-generate an anonymous visitor token for 3-day expiry uploads.
-  if storageto upload --no-token --json "$UPLOAD_FILE" > "$UPLOAD_OUTPUT" 2> "$UPLOAD_ERR"; then
-    echo "    Upload succeeded"
+  # Capture both stdout and stderr - the --json output may include progress lines.
+  # We extract the JSON object from the combined output using jq walk.
+  storageto upload --no-token --json "$UPLOAD_FILE" > "$UPLOAD_OUTPUT" 2>&1 || true
+  echo "    Upload finished"
+  # Dump raw output for debugging
+  echo "    Raw output (first 2000 chars):"
+  head -c 2000 "$UPLOAD_OUTPUT" 2>/dev/null || echo "(empty)"
+  echo ""
+  # Extract the last valid JSON object from the combined output
+  # storageto outputs progress lines to stderr and JSON to stdout;
+  # but with 2>&1 they may be interleaved. Use jq to walk all JSON values.
+  EXTRACTED=0
+  if jq -e . "$UPLOAD_OUTPUT" >/dev/null 2>&1; then
+    # Whole file is valid JSON
+    EXTRACTED=1
   else
-    EXIT_CODE=$?
-    echo "    Upload FAILED (exit=$EXIT_CODE)"
-    cat "$UPLOAD_ERR" 2>/dev/null || true
-    cat "$UPLOAD_OUTPUT" 2>/dev/null || true
-    send_alert "❌ Upload failed for: $URL"
-    rm -f "$UPLOAD_FILE" "$TMP_FILE" "$UPLOAD_OUTPUT" "$UPLOAD_ERR"
+    # Try to extract JSON from mixed output
+    python3 -c "
+import sys, json
+data = open('$UPLOAD_OUTPUT').read()
+decoder = json.JSONDecoder()
+pos = 0
+last = None
+while pos < len(data):
+    try:
+        obj, end = decoder.raw_decode(data, pos)
+        last = obj
+        pos = end
+    except:
+        pos += 1
+if last:
+    print(json.dumps(last))
+" > "${UPLOAD_OUTPUT}.clean" 2>/dev/null && [ -s "${UPLOAD_OUTPUT}.clean" ]
+    if [ -f "${UPLOAD_OUTPUT}.clean" ] && jq -e . "${UPLOAD_OUTPUT}.clean" >/dev/null 2>&1; then
+      mv "${UPLOAD_OUTPUT}.clean" "$UPLOAD_OUTPUT"
+      EXTRACTED=1
+    fi
+  fi
+  if [ "$EXTRACTED" -eq 0 ]; then
+    echo "    Could not parse JSON from storageto output"
+    send_alert "Upload completed but JSON parse failed for: $URL"
+    rm -f "$UPLOAD_FILE" "$TMP_FILE" "$UPLOAD_OUTPUT" "${UPLOAD_OUTPUT}.clean"
     i=$((i+1))
     continue
   fi
@@ -168,7 +199,7 @@ while [ "$i" -lt "$URL_COUNT" ]; do
       done
 
       # For collection, we already added all files above; skip the single-file append below
-      rm -f "$UPLOAD_FILE" "$TMP_FILE" "$UPLOAD_OUTPUT" "$UPLOAD_ERR"
+      rm -f "$UPLOAD_FILE" "$TMP_FILE" "$UPLOAD_OUTPUT"
       check_disk
       i=$((i+1))
       continue
@@ -197,7 +228,7 @@ while [ "$i" -lt "$URL_COUNT" ]; do
   mv "$RESULTS_TEMP" "$RESULTS_JSON"
 
   echo "    Cleaning up: $UPLOAD_FILE"
-  rm -f "$UPLOAD_FILE" "$TMP_FILE" "$UPLOAD_OUTPUT" "$UPLOAD_ERR"
+  rm -f "$UPLOAD_FILE" "$TMP_FILE" "$UPLOAD_OUTPUT"
 
   check_disk
   i=$((i+1))
